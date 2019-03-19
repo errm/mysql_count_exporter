@@ -8,6 +8,7 @@ builds:
     - amd64
 dockers:
   - image_templates:
+    - "errm/mysql-count-exporter:latest"
     - "errm/mysql-count-exporter:{{.Version}}"
 archive:
   replacements:
