@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"flag"
+	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
@@ -92,5 +94,9 @@ func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
 func main() {
 	prometheus.MustRegister(NewMysqlCountCollector(*dsn))
 	http.Handle(*path, promhttp.Handler())
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Hello, please go to %q for metrics", html.EscapeString(*path))
+	})
+
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
