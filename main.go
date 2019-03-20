@@ -6,11 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
-	"github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -27,138 +25,72 @@ const (
 )
 
 var (
-	rowCount = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: subsystem,
-			Name:      "row_count",
-			Help:      "Number of rows in the table",
-		},
-		[]string{
-			"schema",
-			"table",
-		},
-	)
-	countTime = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: namespace,
-			Subsystem: subsystem,
-			Name:      "row_count_duration",
-			Help:      "Time taken to count the rows in this table",
-		},
-		[]string{
-			"schema",
-			"table",
-		},
-	)
-	tables = make(map[string]prometheus.Labels)
+	addr = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
+	path = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
+	dsn  = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
 )
 
-var (
-	addr  = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
-	path  = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
-	pause = MustParseDuration(*flag.String("pause-duration", "10s", "A number of seconds to wait before re-counting rows"))
-	dsn   = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
-)
-
-func Connect() (*sql.DB, error) {
-	return sql.Open("mysql", *dsn)
+func NewMysqlCountCollector(dataSourceName string) *MysqlCountCollector {
+	return &MysqlCountCollector{
+		dsn: dataSourceName,
+		desc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, subsystem, "row_count"),
+			"Number of rows in the table",
+			[]string{"schema", "table"},
+			nil,
+		),
+	}
 }
 
-func ListTables(db *sql.DB) error {
-	rows, err := db.Query(listTablesQuery)
-	if err != nil {
-		return err
-	}
+type MysqlCountCollector struct {
+	dsn  string
+	desc *prometheus.Desc
+}
 
-	defer rows.Close()
+func (c *MysqlCountCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
+	db, err := sql.Open("mysql", c.dsn)
+	if err != nil {
+		log.Printf("error connecting to database: %v", err)
+		return
+	}
+	defer db.Close()
+
+	tables, err := db.Query(listTablesQuery)
+	defer tables.Close()
+	if err != nil {
+		log.Printf("error listing tables: %v", err)
+		return
+	}
 
 	var schema string
 	var table string
+	var count float64
 
-	for rows.Next() {
-		if err := rows.Scan(
+	for tables.Next() {
+		if err := tables.Scan(
 			&schema,
 			&table,
 		); err != nil {
-			return err
+			log.Printf("error listing tables: %v", err)
+			continue
 		}
-		tables[schema+"."+table] = prometheus.Labels{"schema": schema, "table": table}
-	}
-	return nil
-}
 
-func CountRows(db *sql.DB) error {
-	for table, labels := range tables {
-		timer := prometheus.NewTimer(prometheus.ObserverFunc(countTime.With(labels).Set))
-		row := db.QueryRow("SELECT COUNT(*) FROM " + table)
-		var count float64
+		row := db.QueryRow("SELECT COUNT(*) FROM " + schema + "." + table)
 		if err := row.Scan(&count); err != nil {
-			if mysqlerr, ok := err.(*mysql.MySQLError); ok && mysqlerr.Number == 1146 {
-				rowCount.Delete(labels)
-				countTime.Delete(labels)
-				delete(tables, table)
-			} else {
-				return err
-			}
-		} else {
-			rowCount.With(labels).Set(count)
+			log.Printf("error counting rows: %v", err)
+			continue
 		}
-		timer.ObserveDuration()
-	}
-	return nil
-}
 
-func ClearMetrics() {
-	for table, labels := range tables {
-		rowCount.Delete(labels)
-		countTime.Delete(labels)
-		delete(tables, table)
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, count, schema, table)
 	}
-}
-
-func OnErr(message string, err error) {
-	log.Printf("%s: %v", message, err)
-	ClearMetrics()
-	time.Sleep(pause)
-}
-
-func MustParseDuration(d string) time.Duration {
-	duration, err := time.ParseDuration(d)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return duration
 }
 
 func main() {
-	db, err := Connect()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	defer db.Close()
-
-	go func() {
-		for {
-			if err = db.Ping(); err != nil {
-				OnErr("Error connecting to database", err)
-				continue
-			}
-			if err := ListTables(db); err != nil {
-				OnErr("Error listing tables", err)
-				continue
-			}
-
-			if err := CountRows(db); err != nil {
-				OnErr("Error counting rows", err)
-				continue
-			}
-
-			time.Sleep(pause)
-		}
-	}()
-
+	prometheus.MustRegister(NewMysqlCountCollector(*dsn))
 	http.Handle(*path, promhttp.Handler())
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
