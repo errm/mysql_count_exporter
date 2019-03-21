@@ -49,31 +49,55 @@ type MysqlCountCollector struct {
 	desc *prometheus.Desc
 }
 
+type MysqlTable struct {
+	schema string
+	table  string
+}
+
 func (c *MysqlCountCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.desc
 }
 
 func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
 	db, err := sql.Open("mysql", c.dsn)
+	defer db.Close()
+
 	if err != nil {
 		log.Printf("error connecting to database: %v", err)
 		return
 	}
-	defer db.Close()
 
-	tables, err := db.Query(listTablesQuery)
-	defer tables.Close()
-	if err != nil {
-		log.Printf("error listing tables: %v", err)
-		return
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	var count float64
+	for _, t := range ListTables(db) {
+		row := db.QueryRow("SELECT COUNT(*) FROM " + t.schema + "." + t.table)
+		if err := row.Scan(&count); err != nil {
+			log.Printf("error counting rows: %v", err)
+			continue
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, count, t.schema, t.table)
 	}
 
+}
+
+func ListTables(db *sql.DB) []MysqlTable {
 	var schema string
 	var table string
-	var count float64
+	var tables []MysqlTable
 
-	for tables.Next() {
-		if err := tables.Scan(
+	list, err := db.Query(listTablesQuery)
+	defer list.Close()
+
+	if err != nil {
+		log.Printf("error listing tables: %v", err)
+		return tables
+	}
+
+	for list.Next() {
+		if err := list.Scan(
 			&schema,
 			&table,
 		); err != nil {
@@ -81,17 +105,14 @@ func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		row := db.QueryRow("SELECT COUNT(*) FROM " + schema + "." + table)
-		if err := row.Scan(&count); err != nil {
-			log.Printf("error counting rows: %v", err)
-			continue
-		}
-
-		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, count, schema, table)
+		tables = append(tables, MysqlTable{schema: schema, table: table})
 	}
+
+	return tables
 }
 
 func main() {
+	flag.Parse()
 	prometheus.MustRegister(NewMysqlCountCollector(*dsn))
 	http.Handle(*path, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
