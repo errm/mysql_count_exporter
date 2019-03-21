@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"sync"
 
@@ -42,6 +43,7 @@ var (
 	path        = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
 	dsn         = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
 	connections = flag.Int("max-connections", 1, "The maximum number of connections that will be opened to mysql")
+	ignore      = flag.String("ignore", "", "Regex that matches table names to ignore")
 )
 
 func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCountCollector {
@@ -58,12 +60,14 @@ func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCou
 			Name:      "scrape_errors",
 			Help:      "Total number of times a mysql error occurred.",
 		}, []string{"number"}),
+		ignore: regexp.MustCompilePOSIX(*ignore),
 	}
 }
 
 type MysqlCountCollector struct {
 	db           *sql.DB
 	ScrapeErrors *prometheus.CounterVec
+	ignore       *regexp.Regexp
 }
 
 type MysqlTable struct {
@@ -127,6 +131,10 @@ func (c *MysqlCountCollector) listTables() []MysqlTable {
 			&table,
 		); err != nil {
 			log.Printf("error listing tables: %v", err)
+			continue
+		}
+
+		if c.ignore.Match([]byte(schema + "." + table)) {
 			continue
 		}
 
