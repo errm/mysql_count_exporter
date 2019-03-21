@@ -41,7 +41,7 @@ var (
 	addr        = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
 	path        = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
 	dsn         = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
-	connections = flag.Int("max-connections", 10, "The maximum number of connections that will be opened to mysql")
+	connections = flag.Int("max-connections", 1, "The maximum number of connections that will be opened to mysql")
 )
 
 func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCountCollector {
