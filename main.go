@@ -8,8 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -27,26 +29,41 @@ const (
 )
 
 var (
-	addr = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
-	path = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
-	dsn  = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
+	rowCountDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, subsystem, "row_count"),
+		"Number of rows in the table",
+		[]string{"schema", "table"},
+		nil,
+	)
 )
 
-func NewMysqlCountCollector(dataSourceName string) *MysqlCountCollector {
+var (
+	addr        = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
+	path        = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
+	dsn         = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
+	connections = flag.Int("max-connections", 10, "The maximum number of connections that will be opened to mysql")
+)
+
+func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCountCollector {
+	db, err := sql.Open("mysql", dataSourceName)
+	db.SetMaxOpenConns(maxConnections)
+	if err != nil {
+		log.Fatalf("error connecting to database: %v", err)
+	}
 	return &MysqlCountCollector{
-		dsn: dataSourceName,
-		desc: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, subsystem, "row_count"),
-			"Number of rows in the table",
-			[]string{"schema", "table"},
-			nil,
-		),
+		db: db,
+		ScrapeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "scrape_errors",
+			Help:      "Total number of times a mysql error occurred.",
+		}, []string{"number"}),
 	}
 }
 
 type MysqlCountCollector struct {
-	dsn  string
-	desc *prometheus.Desc
+	db           *sql.DB
+	ScrapeErrors *prometheus.CounterVec
 }
 
 type MysqlTable struct {
@@ -55,46 +72,54 @@ type MysqlTable struct {
 }
 
 func (c *MysqlCountCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.desc
+	c.ScrapeErrors.Describe(ch)
+	ch <- rowCountDesc
 }
 
 func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
-	db, err := sql.Open("mysql", c.dsn)
-	defer db.Close()
+	c.scrape(ch)
+	c.ScrapeErrors.Collect(ch)
+}
 
-	if err != nil {
-		log.Printf("error connecting to database: %v", err)
+func (c *MysqlCountCollector) scrape(ch chan<- prometheus.Metric) {
+	var wg sync.WaitGroup
+	for _, t := range c.listTables() {
+		wg.Add(1)
+		go c.countTable(t.schema, t.table, ch, &wg)
+	}
+	wg.Wait()
+}
+
+func (c *MysqlCountCollector) countTable(schema, table string, ch chan<- prometheus.Metric, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var count float64
+	row := c.db.QueryRow("SELECT COUNT(*) FROM " + schema + "." + table)
+	if err := row.Scan(&count); err != nil {
+		log.Printf("error counting rows: %v", err)
+		if mysqlerr, ok := err.(*mysql.MySQLError); ok {
+			c.ScrapeErrors.WithLabelValues(strconv.FormatUint(uint64(mysqlerr.Number), 10)).Inc()
+		}
 		return
 	}
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	var count float64
-	for _, t := range ListTables(db) {
-		row := db.QueryRow("SELECT COUNT(*) FROM " + t.schema + "." + t.table)
-		if err := row.Scan(&count); err != nil {
-			log.Printf("error counting rows: %v", err)
-			continue
-		}
-
-		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, count, t.schema, t.table)
-	}
+	ch <- prometheus.MustNewConstMetric(rowCountDesc, prometheus.GaugeValue, count, schema, table)
 
 }
 
-func ListTables(db *sql.DB) []MysqlTable {
+func (c *MysqlCountCollector) listTables() []MysqlTable {
 	var schema string
 	var table string
 	var tables []MysqlTable
 
-	list, err := db.Query(listTablesQuery)
-	defer list.Close()
-
+	list, err := c.db.Query(listTablesQuery)
 	if err != nil {
 		log.Printf("error listing tables: %v", err)
+		if mysqlerr, ok := err.(*mysql.MySQLError); ok {
+			c.ScrapeErrors.WithLabelValues(strconv.FormatUint(uint64(mysqlerr.Number), 10)).Inc()
+		}
 		return tables
 	}
+
+	defer list.Close()
 
 	for list.Next() {
 		if err := list.Scan(
@@ -113,8 +138,14 @@ func ListTables(db *sql.DB) []MysqlTable {
 
 func main() {
 	flag.Parse()
-	prometheus.MustRegister(NewMysqlCountCollector(*dsn))
+
+	collector := NewMysqlCountCollector(*dsn, *connections)
+	defer collector.db.Close()
+
+	prometheus.MustRegister(collector)
+
 	http.Handle(*path, promhttp.Handler())
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Hello, please go to %q for metrics", html.EscapeString(*path))
 	})
