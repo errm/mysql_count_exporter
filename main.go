@@ -46,10 +46,10 @@ var (
 
 func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCountCollector {
 	db, err := sql.Open("mysql", dataSourceName)
-	db.SetMaxOpenConns(maxConnections)
 	if err != nil {
 		log.Fatalf("error connecting to database: %v", err)
 	}
+	db.SetMaxOpenConns(maxConnections)
 	return &MysqlCountCollector{
 		db: db,
 		ScrapeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
