@@ -134,7 +134,7 @@ func (c *MysqlCountCollector) listTables() []MysqlTable {
 			continue
 		}
 
-		if c.ignore.Match([]byte(schema + "." + table)) {
+		if c.ignore.String() != "" && c.ignore.Match([]byte(schema+"."+table)) {
 			continue
 		}
 
