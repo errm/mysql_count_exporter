@@ -10,11 +10,11 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"sync"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -39,19 +39,19 @@ var (
 )
 
 var (
-	addr        = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
-	path        = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
-	dsn         = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
-	connections = flag.Int("max-connections", 1, "The maximum number of connections that will be opened to mysql")
-	ignore      = flag.String("ignore", "", "Regex that matches table names to ignore")
+	addr         = flag.String("listen-address", ":9557", "The address to listen on for telemetry.")
+	path         = flag.String("telemetry-path", "/metrics", "Path under which to expose metrics.")
+	dsn          = flag.String("dsn", os.Getenv("DATA_SOURCE_NAME"), "A number of seconds to wait before re-counting rows")
+	ignore       = flag.String("ignore", "", "Regex that matches table names to ignore")
+	requestGroup singleflight.Group
 )
 
-func NewMysqlCountCollector(dataSourceName string, maxConnections int) *MysqlCountCollector {
+func NewMysqlCountCollector(dataSourceName string) *MysqlCountCollector {
 	db, err := sql.Open("mysql", dataSourceName)
 	if err != nil {
 		log.Fatalf("error connecting to database: %v", err)
 	}
-	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxOpenConns(1)
 	return &MysqlCountCollector{
 		db: db,
 		ScrapeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -81,21 +81,29 @@ func (c *MysqlCountCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *MysqlCountCollector) Collect(ch chan<- prometheus.Metric) {
-	c.scrape(ch)
+	for _, metric := range c.scrape() {
+		ch <- metric
+	}
 	c.ScrapeErrors.Collect(ch)
 }
 
-func (c *MysqlCountCollector) scrape(ch chan<- prometheus.Metric) {
-	var wg sync.WaitGroup
-	for _, t := range c.listTables() {
-		wg.Add(1)
-		go c.countTable(t.schema, t.table, ch, &wg)
-	}
-	wg.Wait()
+func (c *MysqlCountCollector) scrape() []prometheus.Metric {
+	v, _, _ := requestGroup.Do("scrape", func() (interface{}, error) {
+		var metrics []prometheus.Metric
+		for _, t := range c.listTables() {
+			metric, err := c.countTable(t.schema, t.table)
+			if err != nil {
+				continue
+			}
+			metrics = append(metrics, *metric)
+		}
+		return metrics, nil
+	})
+
+	return v.([]prometheus.Metric)
 }
 
-func (c *MysqlCountCollector) countTable(schema, table string, ch chan<- prometheus.Metric, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (c *MysqlCountCollector) countTable(schema, table string) (*prometheus.Metric, error) {
 	var count float64
 	row := c.db.QueryRow("SELECT COUNT(*) FROM " + schema + "." + table)
 	if err := row.Scan(&count); err != nil {
@@ -103,9 +111,10 @@ func (c *MysqlCountCollector) countTable(schema, table string, ch chan<- prometh
 		if mysqlerr, ok := err.(*mysql.MySQLError); ok {
 			c.ScrapeErrors.WithLabelValues(strconv.FormatUint(uint64(mysqlerr.Number), 10)).Inc()
 		}
-		return
+		return nil, err
 	}
-	ch <- prometheus.MustNewConstMetric(rowCountDesc, prometheus.GaugeValue, count, schema, table)
+	metric := prometheus.MustNewConstMetric(rowCountDesc, prometheus.GaugeValue, count, schema, table)
+	return &metric, nil
 
 }
 
@@ -147,7 +156,7 @@ func (c *MysqlCountCollector) listTables() []MysqlTable {
 func main() {
 	flag.Parse()
 
-	collector := NewMysqlCountCollector(*dsn, *connections)
+	collector := NewMysqlCountCollector(*dsn)
 	defer collector.db.Close()
 
 	prometheus.MustRegister(collector)
